@@ -1,0 +1,412 @@
+---
+description: >
+  Docebo OAuth2 authentication and SSO user provisioning for HCP Portal (PHP/TYPO3 backend).
+  Covers all three grant types (JWT Bearer, Resource Owner Password, Client Credentials),
+  token lifecycle management, refresh tokens, SSO deep-link URLs, and automatic user
+  provisioning/deprovisioning flows. Use this rule when implementing Docebo authentication,
+  token exchange, SSO integration, user auto-provisioning, or debugging 401/403 errors from
+  the Docebo API. Also triggers for questions about Docebo OAuth2 scopes, token expiry,
+  private/public key setup, or the API and SSO app configuration.
+globs: "**/*.php,**/Configuration/**"
+alwaysApply: false
+---
+
+# Docebo Authentication & SSO — HCP Portal
+
+## Authentication Architecture
+
+The HCP Portal (TYPO3) acts as the **Identity Provider (IdP)** — it owns HCP credentials and
+sessions. Docebo is the **Service Provider (SP)** — it provides learning content and APIs.
+The portal backend handles all token exchange; the frontend never sees Docebo credentials.
+
+```
+HCP Browser  ←→  TYPO3 Portal (PHP)  ←→  Docebo OAuth2 Endpoint
+                   ↑ IdP                    ↑ SP
+                   Owns HCP session         Provides learning APIs
+                   Signs JWT tokens         Validates & returns access_token
+```
+
+## OAuth2 Endpoint
+
+```
+POST https://merzaestheticsexchangesandbox.docebosaas.com/oauth2/token
+Content-Type: application/x-www-form-urlencoded
+```
+
+## Three Grant Types Compared
+
+| Grant Type | Best For | Security | Complexity |
+|---|---|---|---|
+| **JWT Bearer** (RS256) | Production SSO, embedded learning | Highest (no secret transmitted) | Medium |
+| **Client Credentials** | Server-to-server admin tasks | Medium (secret stays server-side) | Low |
+| **Resource Owner Password** | Legacy/simple setups | Lower (credentials transmitted) | Low |
+
+**Recommendation**: Use **JWT Bearer** for embedded learning token provisioning (user-context tokens)
+and **Client Credentials** for backend admin/sync operations (service-context tokens).
+
+## Grant Type 1: JWT Bearer (Recommended for SSO)
+
+### Setup Requirements
+
+1. Generate an RSA key pair (RS256):
+   ```bash
+   # Generate private key (keep secure, NEVER commit to repo)
+   openssl genrsa -out docebo_private.pem 2048
+   # Extract public key
+   openssl rsa -in docebo_private.pem -pubout -out docebo_public.pem
+   ```
+
+2. In Docebo: Admin → Settings → API and SSO app → Add OAuth2 client → JWT Bearer grant
+3. Upload `docebo_public.pem` to the Docebo OAuth2 client configuration
+4. Note the `client_id` (you do NOT get a client_secret for JWT Bearer)
+
+### PHP Implementation
+
+```php
+<?php
+// EXT:hcp_portal/Classes/Service/DoceboJwtTokenService.php
+
+namespace Merz\HcpPortal\Service;
+
+use Firebase\JWT\JWT;
+
+class DoceboJwtTokenService implements DoceboTokenService
+{
+    private string $clientId;
+    private string $privateKeyPath;
+    private string $doceboDomain = 'merzaestheticsexchange.docebosaas.com';
+
+    private ?string $cachedToken = null;
+    private ?int $tokenExpiry = null;
+
+    public function __construct(string $clientId, string $privateKeyPath)
+    {
+        $this->clientId = $clientId;
+        $this->privateKeyPath = $privateKeyPath;
+    }
+
+    /**
+     * Get a user-context access token for embedded learning.
+     * The token inherits the permissions of the specified user.
+     *
+     * @param string $userEmail Docebo username (email) of the HCP
+     * @return string Docebo access_token
+     */
+    public function getUserToken(string $userEmail): string
+    {
+        $jwt = $this->buildJwt($userEmail);
+        return $this->exchangeJwtForToken($jwt);
+    }
+
+    /**
+     * Get a service-context access token (Superadmin).
+     * Use for backend admin operations (user sync, enrollment, reporting).
+     *
+     * @return string Docebo access_token
+     */
+    public function getServiceToken(): string
+    {
+        // Check cache
+        if ($this->cachedToken && $this->tokenExpiry > time() + 60) {
+            return $this->cachedToken;
+        }
+
+        // Use a dedicated Docebo service account (Superadmin)
+        $jwt = $this->buildJwt($this->getServiceAccountEmail());
+        $token = $this->exchangeJwtForToken($jwt);
+
+        $this->cachedToken = $token;
+        $this->tokenExpiry = time() + 3600; // Default expiry
+
+        return $token;
+    }
+
+    public function isExpired(): bool
+    {
+        return !$this->tokenExpiry || $this->tokenExpiry <= time() + 60;
+    }
+
+    private function buildJwt(string $subject): string
+    {
+        $now = time();
+        $payload = [
+            'iss' => $this->clientId,
+            'sub' => $subject,      // Docebo username (usually email)
+            'aud' => $this->doceboDomain,
+            'iat' => $now,
+            'exp' => $now + 300     // Short-lived JWT (5 min), not the access_token
+        ];
+
+        $privateKey = file_get_contents($this->privateKeyPath);
+        return JWT::encode($payload, $privateKey, 'RS256');
+    }
+
+    private function exchangeJwtForToken(string $jwt): string
+    {
+        $ch = curl_init('https://' . $this->doceboDomain . '/oauth2/token');
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
+            CURLOPT_POSTFIELDS => http_build_query([
+                'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                'scope' => 'api',
+                'assertion' => $jwt
+            ]),
+            CURLOPT_TIMEOUT => 10,
+        ]);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($httpCode !== 200) {
+            throw new DoceboAuthException(
+                'JWT token exchange failed: HTTP ' . $httpCode . ' — ' . $response
+            );
+        }
+
+        $data = json_decode($response, true);
+        return $data['access_token'];
+    }
+
+    private function getServiceAccountEmail(): string
+    {
+        // Dedicated Docebo Superadmin account for API operations
+        // Configure via TYPO3 extension settings or environment variable
+        return getenv('DOCEBO_SERVICE_ACCOUNT') ?: 'hcp-portal-service@merz.com';
+    }
+}
+```
+
+### JWT Payload Reference
+
+| Claim | Required | Description |
+|---|---|---|
+| `iss` | Yes | OAuth2 client_id from Docebo |
+| `sub` | Yes | Docebo username of the user (usually email) |
+| `aud` | Yes | Docebo platform domain (without https://) |
+| `iat` | Yes | Issued at (Unix timestamp) |
+| `exp` | Yes | Expiry (Unix timestamp, keep short: 5 min) |
+
+## Grant Type 2: Client Credentials (Server-to-Server)
+
+Best for backend cron jobs, data sync, reporting extraction — no user context needed.
+
+```php
+<?php
+class DoceboClientCredentialsService
+{
+    public function getToken(): string
+    {
+        $ch = curl_init('https://merzaestheticsexchangesandbox.docebosaas.com/oauth2/token');
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POSTFIELDS => http_build_query([
+                'client_id' => getenv('DOCEBO_CLIENT_ID'),
+                'client_secret' => getenv('DOCEBO_CLIENT_SECRET'),
+                'grant_type' => 'client_credentials',
+                'scope' => 'api'
+            ])
+        ]);
+
+        $result = json_decode(curl_exec($ch), true);
+        curl_close($ch);
+
+        return $result['access_token'];
+    }
+}
+```
+
+**Note**: Client Credentials tokens operate at the application level, not user level.
+Permissions depend on the OAuth2 app configuration in Docebo.
+
+## Grant Type 3: Resource Owner Password
+
+Use only for legacy/testing scenarios.
+
+```php
+$ch = curl_init('https://merzaestheticsexchangesandbox.docebosaas.com/oauth2/token');
+curl_setopt_array($ch, [
+    CURLOPT_POST => true,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POSTFIELDS => http_build_query([
+        'client_id' => getenv('DOCEBO_CLIENT_ID'),
+        'client_secret' => getenv('DOCEBO_CLIENT_SECRET'),
+        'grant_type' => 'password',
+        'username' => $userEmail,
+        'password' => $userPassword,
+        'scope' => 'api'
+    ])
+]);
+```
+
+## Token Lifecycle
+
+- **Access token TTL**: Configurable, default ~3600 seconds (1 hour)
+- **Refresh token TTL**: 14 days
+- **Refresh flow**: Use the refresh_token from the initial response
+
+```php
+// Refresh an expired token
+$ch = curl_init('https://merzaestheticsexchangesandbox.docebosaas.com/oauth2/token');
+curl_setopt_array($ch, [
+    CURLOPT_POST => true,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POSTFIELDS => http_build_query([
+        'grant_type' => 'refresh_token',
+        'refresh_token' => $storedRefreshToken,
+        'client_id' => getenv('DOCEBO_CLIENT_ID')
+    ])
+]);
+```
+
+## SSO Deep-Link URL
+
+To redirect an HCP from the portal directly into Docebo with automatic login:
+
+```
+https://merzaestheticsexchangesandbox.docebosaas.com/learn;type=oauth2_response;access_token={TOKEN};expires_in=4000;token_type=bearer;scope=api
+```
+
+This is useful for fallback scenarios where embedded learning is not available
+(e.g., complex ILT sessions, admin-level course management).
+
+## Automatic User Provisioning Flow
+
+When an HCP logs into the portal for the first time, the backend should
+auto-provision them in Docebo before generating an embedded learning token.
+
+```php
+<?php
+class DoceboUserProvisioningService
+{
+    private DoceboApiClient $api;
+    private DoceboJwtTokenService $tokenService;
+
+    /**
+     * Ensure HCP exists in Docebo. Create if new, update if changed.
+     * Called during portal login or first access to learning content.
+     *
+     * @param HcpUser $hcp  Portal user object
+     * @param int $branchId Docebo branch ID for the HCP's cluster
+     * @return int Docebo user ID
+     */
+    public function provisionUser(HcpUser $hcp, int $branchId): int
+    {
+        // Step 1: Check if user exists in Docebo
+        $existing = $this->findDoceboUser($hcp->getEmail());
+
+        if ($existing) {
+            // Step 2a: Update if attributes changed
+            $this->syncUserAttributes($existing['user_id'], $hcp, $branchId);
+            return $existing['user_id'];
+        }
+
+        // Step 2b: Create new user
+        $result = $this->api->request('POST', '/manage/v1/user', [
+            'userid' => $hcp->getEmail(),
+            'email' => $hcp->getEmail(),
+            'password' => bin2hex(random_bytes(16)), // Random, user never types it
+            'firstname' => $hcp->getFirstName(),
+            'lastname' => $hcp->getLastName(),
+            'role' => 'learner',
+            'branch_id' => $branchId,
+            'language' => $this->mapPortalLanguageToDocebo($hcp->getLanguage()),
+            'valid' => true,
+            // Map custom fields (e.g., specialty, clinic name)
+            'field_1' => $hcp->getSpecialty(),
+            'field_2' => $hcp->getClinicName(),
+        ]);
+
+        return $result['data']['user_id'];
+    }
+
+    /**
+     * Deprovisioning: deactivate (don't delete) to preserve training records.
+     */
+    public function deprovisionUser(string $email): void
+    {
+        $user = $this->findDoceboUser($email);
+        if ($user) {
+            $this->api->request('PUT', '/manage/v1/user/' . $user['user_id'], [
+                'valid' => false
+            ]);
+        }
+    }
+
+    private function findDoceboUser(string $email): ?array
+    {
+        $result = $this->api->request('GET', '/manage/v1/user', [
+            'search_text' => $email,
+            'page_size' => 1
+        ]);
+
+        $items = $result['data']['items'] ?? [];
+        return !empty($items) ? $items[0] : null;
+    }
+
+    private function syncUserAttributes(int $userId, HcpUser $hcp, int $branchId): void
+    {
+        $this->api->request('PUT', '/manage/v1/user/' . $userId, [
+            'firstname' => $hcp->getFirstName(),
+            'lastname' => $hcp->getLastName(),
+            'branch_id' => $branchId,
+            'language' => $this->mapPortalLanguageToDocebo($hcp->getLanguage()),
+            'valid' => true, // Re-activate if previously deactivated
+            'field_1' => $hcp->getSpecialty(),
+        ]);
+    }
+
+    private function mapPortalLanguageToDocebo(string $portalLang): string
+    {
+        $map = [
+            'es' => 'spanish',   'de' => 'german',    'fr' => 'french',
+            'it' => 'italian',   'pt' => 'portuguese', 'en' => 'english',
+            'nl' => 'dutch',     'ru' => 'russian',    'ar' => 'arabic',
+            'tr' => 'turkish',
+        ];
+        return $map[$portalLang] ?? 'english';
+    }
+}
+```
+
+## TYPO3 Extension Configuration
+
+```php
+// EXT:hcp_portal/ext_conf_template.txt (or ext_localconf.php settings)
+// Store sensitive values in environment variables, NOT in TYPO3 settings
+
+// Required environment variables:
+// DOCEBO_CLIENT_ID        — OAuth2 client ID from Docebo API & SSO app
+// DOCEBO_CLIENT_SECRET    — Only for Client Credentials grant (NOT for JWT)
+// DOCEBO_PRIVATE_KEY_PATH — Absolute path to RS256 private key PEM file
+// DOCEBO_SERVICE_ACCOUNT  — Email of the Docebo Superadmin service account
+```
+
+## Critical Security Rules
+
+- **Private key**: Store outside web root, readable only by PHP process. NEVER commit to git.
+- **Client secret**: Store as environment variable or TYPO3 encrypted configuration. NEVER in code.
+- **JWT tokens are short-lived** (5 min) — they're only used to obtain the access_token
+- **Access tokens**: Cache server-side with TTL slightly less than `expires_in`
+- **Deprovisioning**: Deactivate users (`valid: false`) rather than deleting to preserve learning records
+- **The `sub` claim in JWT must match an existing Docebo username** — provision the user BEFORE generating their embedded learning token
+- **Permissions are role-based**: A token for a `learner` user cannot perform admin operations even if the OAuth2 app has broad permissions
+
+## Debugging Auth Issues
+
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| 401 Unauthorized | Token expired or malformed | Check token TTL; regenerate |
+| 403 Forbidden | User role lacks permission | Check Docebo user role; use Superadmin for admin ops |
+| `invalid_grant` | JWT `sub` user doesn't exist in Docebo | Provision user first |
+| `invalid_client` | Wrong client_id or public key mismatch | Verify Docebo OAuth2 app config |
+| Token works in API browser but not in code | Different user context (API browser uses your login) | Ensure code uses correct grant type |
+
+## Docebo Documentation Links
+
+- API authentication: https://help.docebo.com/hc/en-us/articles/360020082060
+- Embedded learning auth best practices: https://help.docebo.com/hc/en-us/articles/4407573544338
+- JWT standard (RFC 7519): https://datatracker.ietf.org/doc/html/rfc7519

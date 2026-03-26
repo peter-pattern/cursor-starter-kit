@@ -1,0 +1,420 @@
+---
+description: >
+  Docebo REST API patterns for HCP Portal backend integration (PHP/TYPO3).
+  Covers user management, course CRUD, enrollment operations, certifications, learning plans,
+  catalog management, and reporting endpoints. Use this rule when writing PHP code that calls
+  Docebo API endpoints, building TYPO3 backend services for Docebo data sync, working with
+  /manage/v1/ or /learn/v1/ or /course/v1/ endpoints, handling pagination or batch operations,
+  or integrating Docebo data into the HCP Portal. Also use for questions about Docebo API
+  rate limits, pagination, error handling, or endpoint discovery.
+globs: "**/*.php,**/*.json"
+alwaysApply: false
+---
+
+# Docebo REST API Patterns — HCP Portal Backend
+
+## API Architecture
+
+- **Base URL**: `https://merzaestheticsexchangesandbox.docebosaas.com`
+- **API Browser**: `https://merzaestheticsexchangesandbox.docebosaas.com/api-browser/`
+- **Auth**: OAuth2 Bearer token (see `docebo-auth-sso.mdc` for token acquisition)
+- **Format**: JSON request/response
+- **Rate limits**: Platform-dependent; handle HTTP 429 with exponential backoff
+
+## API Services Overview
+
+| Service | Base Path | Scope |
+|---|---|---|
+| **manage** | `/manage/v1/` | Users, branches (org chart), groups, power users |
+| **learn** | `/learn/v1/` | Courses, enrollments, catalogs, training materials, learning plans |
+| **course** | `/course/v1/` | Course creation/update, sections, prerequisites |
+| **learningplan** | `/learningplan/v1/` | Learning plan management and enrollment |
+| **certification** | `/manage/v1/` | Certification records (under manage service) |
+| **analytics** | `/analytics/v1/` | Reports, exports, scheduled reports |
+| **gamification** | `/gamification/v1/` | Badges, points, leaderboards |
+| **social** | `/social/v1/` | Channels, assets, community content |
+
+## PHP HTTP Client Base Class
+
+```php
+<?php
+// EXT:hcp_portal/Classes/Service/DoceboApiClient.php
+
+namespace Merz\HcpPortal\Service;
+
+class DoceboApiClient
+{
+    private string $baseUrl = 'https://merzaestheticsexchangesandbox.docebosaas.com';
+    private string $accessToken;
+    private DoceboTokenService $tokenService;
+
+    public function __construct(DoceboTokenService $tokenService)
+    {
+        $this->tokenService = $tokenService;
+    }
+
+    /**
+     * Make an authenticated API request to Docebo.
+     *
+     * @param string $method  HTTP method (GET, POST, PUT, DELETE)
+     * @param string $path    API path (e.g., '/learn/v1/courses')
+     * @param array  $params  Query params (GET) or body (POST/PUT)
+     * @param array  $query   Additional query string params for POST/PUT
+     * @return array Decoded JSON response
+     * @throws DoceboApiException
+     */
+    public function request(
+        string $method,
+        string $path,
+        array $params = [],
+        array $query = []
+    ): array {
+        $this->ensureToken();
+
+        $url = $this->baseUrl . $path;
+
+        // Add query string for GET or additional query params
+        if ($method === 'GET' && !empty($params)) {
+            $url .= '?' . http_build_query($params);
+        } elseif (!empty($query)) {
+            $url .= '?' . http_build_query($query);
+        }
+
+        $ch = curl_init($url);
+        $headers = [
+            'Authorization: Bearer ' . $this->accessToken,
+            'Content-Type: application/json',
+            'Accept: application/json'
+        ];
+
+        $options = [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_TIMEOUT => 30,
+        ];
+
+        if ($method === 'POST') {
+            $options[CURLOPT_POST] = true;
+            $options[CURLOPT_POSTFIELDS] = json_encode($params);
+        } elseif ($method === 'PUT') {
+            $options[CURLOPT_CUSTOMREQUEST] = 'PUT';
+            $options[CURLOPT_POSTFIELDS] = json_encode($params);
+        } elseif ($method === 'DELETE') {
+            $options[CURLOPT_CUSTOMREQUEST] = 'DELETE';
+        }
+
+        curl_setopt_array($ch, $options);
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($httpCode === 429) {
+            // Rate limited — implement exponential backoff
+            throw new DoceboRateLimitException('Rate limit exceeded');
+        }
+
+        $decoded = json_decode($response, true);
+
+        if ($httpCode >= 400) {
+            throw new DoceboApiException(
+                $decoded['error'] ?? 'Unknown error',
+                $httpCode,
+                $decoded
+            );
+        }
+
+        return $decoded;
+    }
+
+    /**
+     * Paginated GET — fetches all pages automatically.
+     * WARNING: Use with caution for large datasets; prefer cursor-based pagination.
+     *
+     * @param string $path   API path
+     * @param array  $params Base query params
+     * @param int    $pageSize Items per page (max 200)
+     * @return array All items collected across pages
+     */
+    public function getAllPages(
+        string $path,
+        array $params = [],
+        int $pageSize = 200
+    ): array {
+        $allItems = [];
+        $page = 1;
+        $params['page_size'] = $pageSize;
+
+        do {
+            $params['page'] = $page;
+            $response = $this->request('GET', $path, $params);
+
+            $items = $response['data']['items'] ?? $response['data'] ?? [];
+            $allItems = array_merge($allItems, $items);
+
+            $hasMore = $response['data']['has_more_data'] ?? false;
+            $page++;
+        } while ($hasMore);
+
+        return $allItems;
+    }
+
+    /**
+     * Cursor-based pagination (recommended for large datasets).
+     */
+    public function getAllWithCursor(
+        string $path,
+        array $params = [],
+        int $pageSize = 200
+    ): array {
+        $allItems = [];
+        $params['page_size'] = $pageSize;
+        $params['get_cursor'] = 1;
+        $cursor = null;
+
+        do {
+            if ($cursor) {
+                $params['cursor'] = $cursor;
+            }
+            $response = $this->request('GET', $path, $params);
+
+            $items = $response['data']['items'] ?? $response['data'] ?? [];
+            $allItems = array_merge($allItems, $items);
+
+            $cursor = $response['data']['cursor'] ?? null;
+            $hasMore = $response['data']['has_more_data'] ?? false;
+        } while ($hasMore && $cursor);
+
+        return $allItems;
+    }
+
+    private function ensureToken(): void
+    {
+        if (empty($this->accessToken) || $this->tokenService->isExpired()) {
+            $this->accessToken = $this->tokenService->getServiceToken();
+        }
+    }
+}
+```
+
+## User Management (manage service)
+
+```php
+// --- CREATE USER ---
+$result = $api->request('POST', '/manage/v1/user', [
+    'userid' => 'hcp_12345',               // Username (unique)
+    'email' => 'dr.smith@clinic.com',
+    'password' => bin2hex(random_bytes(16)), // Auto-generated, user logs in via SSO
+    'firstname' => 'John',
+    'lastname' => 'Smith',
+    'role' => 'learner',                    // learner | poweruser | superadmin
+    'branch_id' => 42,                      // Extended Enterprise branch (see EMEA rule)
+    'language' => 'english',
+    'valid' => true                         // Active immediately
+    // Additional fields: 'field_1' => 'value' (platform-specific custom fields)
+]);
+$doceboUserId = $result['data']['user_id'];
+
+// --- GET USER BY EMAIL ---
+$users = $api->request('GET', '/manage/v1/user', [
+    'search_text' => 'dr.smith@clinic.com',
+    'page_size' => 1
+]);
+
+// --- UPDATE USER ---
+$api->request('PUT', '/manage/v1/user/' . $doceboUserId, [
+    'firstname' => 'Jonathan',
+    'branch_id' => 55 // Move to different branch/cluster
+]);
+
+// --- DEACTIVATE USER ---
+$api->request('PUT', '/manage/v1/user/' . $doceboUserId, [
+    'valid' => false
+]);
+
+// --- BATCH USER CREATION ---
+$api->request('POST', '/manage/v1/user/batch', [
+    'items' => [
+        ['userid' => 'hcp_001', 'email' => 'a@b.com', 'firstname' => 'A', 'lastname' => 'B', 'branch_id' => 42],
+        ['userid' => 'hcp_002', 'email' => 'c@d.com', 'firstname' => 'C', 'lastname' => 'D', 'branch_id' => 42],
+    ]
+]);
+```
+
+## Courses & Enrollment (learn service)
+
+```php
+// --- LIST ALL COURSES ---
+$courses = $api->request('GET', '/learn/v1/courses', [
+    'page_size' => 50,
+    'sort_attr' => 'name',
+    'sort_dir' => 'asc'
+]);
+
+// --- GET SINGLE COURSE ---
+$course = $api->request('GET', '/learn/v1/courses/' . $courseId);
+
+// --- GET COURSE ENROLLMENTS ---
+$enrollments = $api->request('GET', '/learn/v1/enrollments', [
+    'id_course' => $courseId,
+    'page_size' => 200
+]);
+
+// --- ENROLL USER IN COURSE ---
+$api->request('POST', '/learn/v1/enrollment/batch', [
+    'items' => [
+        [
+            'user_id' => $doceboUserId,
+            'course_id' => $courseId,
+            'status' => 0  // 0=subscribed, 1=in_progress, 2=completed
+        ]
+    ]
+]);
+
+// --- GET USER'S ENROLLMENTS ---
+$userEnrollments = $api->request('GET', '/learn/v1/enrollments', [
+    'id_user' => $doceboUserId,
+    'page_size' => 200
+]);
+
+// --- MARK ENROLLMENT COMPLETE (batch update) ---
+$api->request('POST', '/learn/v1/enrollment/batch', [
+    'items' => [
+        [
+            'user_id' => $doceboUserId,
+            'course_id' => $courseId,
+            'status' => 2,  // completed
+            'date_complete' => '2026-03-26 12:00:00'
+        ]
+    ]
+]);
+
+// --- TRACK LEARNING OBJECT COMPLETION ---
+$api->request('POST', '/learn/v1/lo/' . $loId . '/track', [
+    'user_id' => $doceboUserId,
+    'status' => 'completed',
+    'score' => 95
+]);
+```
+
+## Catalogs
+
+```php
+// --- LIST CATALOGS ---
+$catalogs = $api->request('GET', '/learn/v1/catalog', [
+    'page_size' => 50
+]);
+
+// --- GET CATALOG CONTENT ---
+$catalogItems = $api->request('GET', '/learn/v1/catalog/' . $catalogId, [
+    'page_size' => 200
+]);
+
+// --- GET CATALOG FILTERS ---
+$filters = $api->request('GET', '/learn/v1/catalog/filters');
+```
+
+## Learning Plans (learningplan service)
+
+```php
+// --- LIST LEARNING PLANS ---
+$lps = $api->request('GET', '/learn/v1/lp', [
+    'page_size' => 50
+]);
+
+// --- GET LP DETAILS ---
+$lp = $api->request('GET', '/learn/v1/lp/' . $lpId);
+
+// --- GET LP COURSES + ENROLLMENT STATUS ---
+$lpCourses = $api->request('GET', '/learningplan/v1/learningplans/' . $lpId . '/courses/enrollments');
+
+// --- ENROLL USER IN LP ---
+$api->request('POST', '/learningplan/v1/learningplans/' . $lpId . '/enrollment', [
+    'user_id' => $doceboUserId
+]);
+```
+
+## Certifications
+
+```php
+// --- GET USER'S CERTIFICATIONS ---
+$certs = $api->request('GET', '/learn/v1/certifications', [
+    'id_user' => $doceboUserId,
+    'page_size' => 200
+]);
+```
+
+## Branches / Org Chart (Extended Enterprise)
+
+```php
+// --- LIST BRANCHES ---
+$branches = $api->request('GET', '/manage/v1/orgchart', [
+    'page_size' => 200
+]);
+
+// --- GET BRANCH BY CODE (secondary identifier) ---
+$branch = $api->request('GET', '/manage/v1/orgchart/' . $branchCode, [
+    'use_secondary_identifier' => 'true'  // Pass branch code instead of numeric ID
+]);
+
+// --- ASSIGN USER TO BRANCH ---
+$api->request('PUT', '/manage/v1/user/' . $doceboUserId, [
+    'branch_id' => $branchId
+]);
+```
+
+## Pagination & Performance Rules
+
+- **Default page size**: 10 (override with `page_size`, max 200)
+- **Cursor pagination**: Add `get_cursor=1` to first request; use returned `cursor` param for subsequent pages
+- **Sort**: Use `sort_attr` (field name) + `sort_dir` (asc/desc)
+- **Rate limits**: If you get HTTP 429, implement exponential backoff (start 1s, double each retry, max 60s)
+- **Batch endpoints** (`/batch`): Use for bulk operations; cannot send concurrent batch calls
+- **Additional fields**: Platform-specific custom fields are referenced as `field_1`, `field_2`, etc.
+
+## Error Handling
+
+```php
+// Standard Docebo error response structure:
+// {
+//   "success": false,
+//   "error": "Error message",
+//   "error_code": 400,
+//   "error_description": "Detailed description"
+// }
+
+// Common HTTP codes:
+// 200 — Success
+// 400 — Bad request (missing/invalid params)
+// 401 — Unauthorized (expired/invalid token)
+// 403 — Forbidden (insufficient permissions for the authenticated user)
+// 404 — Resource not found
+// 429 — Rate limit exceeded
+// 500 — Server error
+```
+
+## Retrieving IDs
+
+Docebo uses **numeric internal IDs** for most resources. Ways to find them:
+
+1. **API response**: Create/list endpoints return the ID in the response
+2. **Platform URL**: Navigate to the resource in Docebo admin → ID is in the URL
+3. **Reports**: Build a Docebo report that includes the ID field, then export
+4. **Secondary identifiers**: Some endpoints accept `use_secondary_identifier=true` to use codes (e.g., branch codes) instead of numeric IDs — but codes are mutable and may not be unique
+
+## Critical Rules
+
+- **Always use Bearer token authentication** — never pass credentials in query strings
+- **Respect rate limits** — implement retry logic with exponential backoff for 429 responses
+- **Use `page_size=200`** (max) for bulk data retrieval to minimize API calls
+- **Prefer cursor-based pagination** for large datasets (add `get_cursor=1`)
+- **Batch APIs cannot run concurrently** — wait for one batch to complete before starting another
+- **Non-ID references** (branch codes, etc.): uniqueness is YOUR responsibility; Docebo returns 400 if ambiguous
+- **Test API calls on sandbox first** — calls in the API browser operate on real production data
+
+## Docebo Documentation Links
+
+- API general info: https://help.docebo.com/hc/en-us/articles/360020082040
+- API services overview: https://help.docebo.com/hc/en-us/articles/23195635608594
+- API browser guide: https://help.docebo.com/hc/en-us/articles/23173336663826
+- Rate limits: https://help.docebo.com/hc/en-us/articles/360020082040 (rate limiting section)
+- Retrieving IDs: https://help.docebo.com/hc/en-us/articles/23174364506514

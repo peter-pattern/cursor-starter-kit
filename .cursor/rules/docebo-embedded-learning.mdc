@@ -1,0 +1,364 @@
+---
+description: >
+  Docebo Embedded Learning SDK integration for HCP Portal (TYPO3/PHP backend + vanilla JS frontend).
+  Covers Building Blocks widgets, Launcher popup, kernel initialization, token provisioning, event listeners,
+  and course player embedding. Use this rule when working on any Docebo widget integration, embedded learning
+  JavaScript code, kernel/DSDK initialization, course player or course list HTML tags (dcbo-*), or frontend
+  learning delivery within the HCP Portal. Also triggers for questions about Docebo Flow, Building Blocks,
+  embedded learning launcher configuration, or widget event handling.
+globs: "**/*.js,**/*.html,**/*.ts,**/fluid/**/*.html,**/Resources/**/*.js"
+alwaysApply: false
+---
+
+# Docebo Embedded Learning SDK — HCP Portal Integration
+
+## Architecture Context
+
+Merz Aesthetics uses **Docebo** (merzaestheticsexchange.docebosaas.com) as the learning platform
+but an **HCP Portal** (TYPO3-based) as the customer-facing frontend. Docebo content is delivered
+to HCPs via the **Embedded Learning SDK** — either as **Building Blocks** (widgets injected into
+portal HTML) or a **Launcher** (floating popup overlay). The portal backend (PHP/TYPO3) handles
+JWT token generation; the frontend (vanilla JS) handles kernel init, widget rendering, and events.
+
+## Platform Details
+
+- **Docebo domain**: `https://merzaestheticsexchangesandbox.docebosaas.com`
+- **API browser**: `https://merzaestheticsexchangesandbox.docebosaas.com/api-browser/`
+- **Kernel URL**: Obtained via API call `GET /manage/v1/app/kernel` (returns latest SDK JS URL)
+- **Embedded Learning admin**: Gear icon → Embedded learning → Manage
+
+## Two Integration Patterns
+
+### Pattern A: Building Blocks (Recommended for deep portal integration)
+
+Widgets are injected directly into TYPO3 Fluid templates as HTML custom elements.
+This gives full layout control and seamless UX within the portal.
+
+### Pattern B: Launcher (Lightweight overlay)
+
+A floating button/icon that opens a popup with Docebo widgets. Lower integration effort,
+but the learning experience feels "bolted on" rather than native.
+
+**Decision criteria**: If HCPs should consume training as a natural part of portal navigation
+(e.g., product pages link to related courses), use Building Blocks. If training is a secondary
+feature accessible from any page, use Launcher.
+
+## Kernel Initialization (Both Patterns)
+
+### Step 1: Load the kernel script
+
+```html
+<!-- In TYPO3 Fluid template or page header -->
+<!-- kernel-link comes from GET /manage/v1/app/kernel API response -->
+<script type="text/javascript" src="{kernel-link}"></script>
+```
+
+### Step 2: Token provider and kernel start
+
+```javascript
+/**
+ * Docebo Embedded Learning — Kernel Initialization
+ *
+ * The token provider function is called by the SDK whenever it needs
+ * a fresh access token (initial load + automatic refresh on expiry).
+ * It MUST return a valid Docebo OAuth2 access_token string.
+ *
+ * CRITICAL: Never expose client_secret in frontend JS.
+ * The TYPO3 backend endpoint handles JWT signing and token exchange.
+ */
+async function renewToken() {
+  // Call your TYPO3 backend endpoint that generates a JWT and exchanges
+  // it for a Docebo access_token server-side
+  const response = await fetch('/api/docebo/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin' // send TYPO3 session cookie
+  });
+
+  if (!response.ok) {
+    throw new Error('Docebo token renewal failed: ' + response.status);
+  }
+
+  const data = await response.json();
+  return data.access_token; // Must return the token string, not the object
+}
+
+// Initialize the kernel
+DSDK.kernel().setTokenProvider(renewToken);
+DSDK.kernel().start({
+  domain: 'https://merzaestheticsexchangesandbox.docebosaas.com',
+  language: 'en' // or dynamically from portal user's language preference
+});
+```
+
+### TYPO3 Backend Token Endpoint (PHP)
+
+```php
+<?php
+// EXT:hcp_portal/Classes/Controller/DoceboTokenController.php
+
+use Firebase\JWT\JWT;
+
+class DoceboTokenController extends ActionController
+{
+    /**
+     * Generate JWT and exchange for Docebo access_token.
+     * Called by frontend renewToken() function.
+     */
+    public function getTokenAction(): ResponseInterface
+    {
+        // Get current HCP user from TYPO3 session
+        $user = $this->getCurrentHcpUser();
+        if (!$user) {
+            return $this->jsonResponse(['error' => 'Not authenticated'], 401);
+        }
+
+        // Build JWT payload
+        $now = time();
+        $payload = [
+            'iss' => $this->settings['docebo']['clientId'],
+            'sub' => $user->getEmail(), // Must match Docebo username
+            'aud' => 'merzaestheticsexchange.docebosaas.com',
+            'iat' => $now,
+            'exp' => $now + 3600
+        ];
+
+        // Sign with RS256 private key (stored securely, NOT in repo)
+        $privateKey = file_get_contents($this->settings['docebo']['privateKeyPath']);
+        $jwt = JWT::encode($payload, $privateKey, 'RS256');
+
+        // Exchange JWT for Docebo access_token
+        $ch = curl_init('https://merzaestheticsexchangesandbox.docebosaas.com/oauth2/token');
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POSTFIELDS => http_build_query([
+                'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                'scope' => 'api',
+                'assertion' => $jwt
+            ])
+        ]);
+
+        $result = json_decode(curl_exec($ch), true);
+        curl_close($ch);
+
+        return $this->jsonResponse([
+            'access_token' => $result['access_token'],
+            'expires_in' => $result['expires_in']
+        ]);
+    }
+}
+```
+
+## Building Blocks Widgets Reference
+
+### Available Widgets
+
+| Widget Tag | Purpose | Key Attributes |
+|---|---|---|
+| `<dcbo-course-player>` | Play course content with full tracking | `courseid`, `autoplay`, `sources`, `showfullscreen`, `showpip` |
+| `<dcbo-my-courses-and-lp>` | List user's enrolled courses/LPs | `itemtype`, `itemstatus`, `includeplayer`, `hidecoursesinlp` |
+| `<dcbo-course-list>` | Static or dynamic course catalog | `type` (static/dynamic), `coursesids`, `maxresults`, `includeplayer` |
+
+### Course Player Widget
+
+```html
+<!-- Standalone course player for a specific course -->
+<div class="hcp-learning-player">
+  <dcbo-course-player
+    id="hcpPlayer1"
+    courseid="INSERT_COURSE_ID"
+    autoplay="false"
+    forcefullscreen="false"
+    showfullscreen="true"
+    showpip="true"
+    showthumbsintoc="false"
+    showpreview="true"
+    showtoc="true">
+  </dcbo-course-player>
+</div>
+
+<!-- Player linked to a course list (sources attribute) -->
+<dcbo-course-player
+  id="hcpPlayer2"
+  autoplay="false"
+  sources="hcpCourseList1">
+</dcbo-course-player>
+```
+
+### My Courses and Learning Plans Widget
+
+```html
+<dcbo-my-courses-and-lp
+  id="hcpMyCourses"
+  includeplayer="true"
+  itemtype="all"
+  itemstatus="inprogress"
+  hidecoursesinlp="false"
+  autoplay="false"
+  forcefullscreen="false"
+  showthumbsintoc="false"
+  showtoc="true"
+  showpip="true"
+  showfullscreen="true">
+</dcbo-my-courses-and-lp>
+```
+
+### Course List Widget
+
+```html
+<!-- Static: show specific courses (e.g., for a product page) -->
+<dcbo-course-list
+  id="hcpCourseList1"
+  type="static"
+  widgettitle="Related Training"
+  coursesids="181,189,190,191"
+  includeplayer="false">
+</dcbo-course-list>
+
+<!-- Dynamic: global search-based catalog -->
+<dcbo-course-list
+  id="hcpCatalog"
+  type="dynamic"
+  widgettitle="Training Catalog"
+  maxresults="20"
+  includeplayer="false">
+</dcbo-course-list>
+```
+
+### Linking Course List to External Player
+
+```html
+<!-- Course list WITHOUT built-in player -->
+<dcbo-course-list
+  id="courseListMain"
+  type="dynamic"
+  widgettitle="Available Courses"
+  maxresults="20"
+  includeplayer="false">
+</dcbo-course-list>
+
+<!-- Separate player that receives course selection from the list -->
+<dcbo-course-player
+  id="mainPlayer"
+  autoplay="true"
+  forcefullscreen="false"
+  showfullscreen="true"
+  showpip="true"
+  sources="courseListMain">
+</dcbo-course-player>
+```
+
+## JavaScript Commands & Events
+
+### Controlling Widgets Programmatically
+
+```javascript
+// Navigate course player to a specific course
+DSDK.widget('hcpPlayer1').command('load', { courseId: 123 });
+
+// Refresh the My Courses widget
+DSDK.widget('hcpMyCourses').command('refresh');
+
+// Open course list dynamic search
+DSDK.widget('hcpCatalog').command('search', { query: 'botox' });
+```
+
+### Event Listeners
+
+```javascript
+// Listen for course completion
+DSDK.getEventManager().on('course.completed', (event, payload) => {
+  console.log('Course completed:', payload);
+  // payload includes: courseId, courseName, userId, completionDate
+  // Trigger HCP Portal actions: update profile, show certificate link, etc.
+  updateHcpCourseStatus(payload.courseId, 'completed');
+});
+
+// Listen for course started
+DSDK.getEventManager().on('course.started', (event, payload) => {
+  console.log('Course started:', payload);
+  trackHcpLearningActivity(payload);
+});
+
+// Listen for training material completed
+DSDK.getEventManager().on('trainingMaterial.completed', (event, payload) => {
+  console.log('Training material completed:', payload);
+});
+
+// Listen for enrollment
+DSDK.getEventManager().on('enrollment.created', (event, payload) => {
+  console.log('User enrolled:', payload);
+});
+
+// Listen for widget ready (useful for loading states)
+DSDK.getEventManager().on('widget.ready', (event, payload) => {
+  // Hide loading spinner, show widget container
+  document.getElementById(payload.widgetId + '-loader').style.display = 'none';
+});
+```
+
+## CSS Customization
+
+Building Blocks use CSS custom properties (tokens) for theming. Wrap them in the widget tag selector:
+
+```css
+/* Match HCP Portal brand colors */
+dcbo-course-player {
+  --dcb-flow-course-player-back-button-icon: 'close';
+}
+
+dcbo-my-courses-and-lp {
+  --dcb-flow-primary-color: #00539B; /* Merz brand blue */
+  --dcb-flow-font-family: 'Open Sans', sans-serif;
+}
+
+/* Container sizing within TYPO3 layout */
+.hcp-learning-player {
+  width: 100%;
+  max-width: 960px;
+  min-height: 540px;
+  margin: 0 auto;
+}
+```
+
+## Content Security Policy Requirements
+
+If the HCP Portal uses CSP headers, add these directives:
+
+```
+script-src  'self' https://*.dcbstatic.com https://merzaestheticsexchangesandbox.docebosaas.com;
+style-src   'self' https://*.dcbstatic.com 'unsafe-inline';
+img-src     'self' https://*.dcbstatic.com https://merzaestheticsexchangesandbox.docebosaas.com;
+frame-src   *.dcbstatic.net;
+child-src   *.dcbstatic.net;
+connect-src 'self' https://merzaestheticsexchangesandbox.docebosaas.com;
+```
+
+## Critical Rules
+
+- **Never expose Docebo client_secret in frontend code** — all token exchange happens server-side in PHP
+- **Always use `setTokenProvider()`** — never hardcode tokens; the SDK handles refresh cycles
+- **Widget IDs must be unique per page** — the DSDK uses them for command routing and event targeting
+- **SCORM/xAPI/AICC content may require third-party cookies** — the portal's cookie policy must allow this
+- **The kernel URL changes with SDK updates** — always fetch it dynamically via `GET /manage/v1/app/kernel`
+- **Course IDs are Docebo internal numeric IDs** — retrieve them from the API or platform URLs, never hardcode display names
+- **Extended Enterprise users must be in the correct branch** before embedded content is visible — see `docebo-emea-branches.mdc`
+
+## TYPO3 Integration Tips
+
+- Load the kernel script via `page.includeJSFooterlibs` in TypoScript for proper load order
+- Use Fluid ViewHelpers to inject course IDs dynamically based on the current product/page context
+- Consider a TYPO3 content element (plugin) that renders a configurable Building Blocks widget
+- Cache the kernel URL in TYPO3 caching framework (TTL ~24h) to avoid extra API calls per page load
+
+## Docebo Documentation Links
+
+- Embedded Learning overview: https://help.docebo.com/hc/en-us/articles/4407577562258
+- Building Blocks: https://help.docebo.com/hc/en-us/articles/4413485966738
+- Launcher: https://help.docebo.com/hc/en-us/articles/7426376690706
+- Course Player widget: https://help.docebo.com/hc/en-us/articles/7429161147154
+- My Courses widget: https://help.docebo.com/hc/en-us/articles/7432111766802
+- Course List widget: https://help.docebo.com/hc/en-us/articles/8157478890898
+- CSP configuration: https://help.docebo.com/hc/en-us/articles/15539609538194
+- Mobile SDK: https://help.docebo.com/hc/en-us/articles/22705349597842

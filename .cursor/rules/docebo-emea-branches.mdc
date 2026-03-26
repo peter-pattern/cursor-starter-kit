@@ -1,0 +1,406 @@
+---
+description: >
+  Docebo Extended Enterprise branch structure for Merz Aesthetics EMEA.
+  Maps EMEA affiliate clusters (Iberia, Italy, DACH, France, UKI, Benelux, Russia, MENA,
+  Distribution Partners) to Docebo org chart branches with branch codes, visibility rules,
+  and catalog/course assignment patterns. Use this rule when writing code that assigns users
+  to branches, implements affiliate-based content visibility, manages multi-cluster enrollment
+  logic, or configures Extended Enterprise branch isolation. Also triggers when working with
+  Docebo org chart API endpoints, branch codes, or EMEA-specific user provisioning.
+globs: "**/*.php,**/*.json,**/*.yaml"
+alwaysApply: false
+---
+
+# Docebo EMEA Extended Enterprise — Branch Structure
+
+## Architecture
+
+Merz Aesthetics EMEA uses Docebo's **Extended Enterprise** feature to isolate learning content
+and user visibility per affiliate cluster. Each cluster maps to a Docebo **branch** in the
+org chart hierarchy. HCPs are assigned to their cluster's branch at provisioning time, and
+content visibility is controlled by catalog-to-branch assignments.
+
+```
+Root Branch (Merz Aesthetics EMEA)
+├── Iberia (ES, PT)
+├── Italy (IT)
+├── DACH (DE, AT, CH)
+├── France (FR)
+├── UKI (GB, IE)
+├── Benelux (NL, BE, LU)
+├── Russia (RU)
+├── MENA (AE, SA, KW, QA, BH, OM, EG, LB, JO)
+└── Distribution Partners (various markets)
+```
+
+## Branch Configuration Template
+
+This template maps cluster identifiers to Docebo branch metadata.
+Replace placeholder IDs with actual Docebo branch IDs from your platform.
+
+```php
+<?php
+// EXT:hcp_portal/Configuration/DoceboBranches.php
+
+namespace Merz\HcpPortal\Configuration;
+
+/**
+ * Docebo Extended Enterprise branch mapping for EMEA clusters.
+ *
+ * IMPORTANT: Branch IDs are Docebo internal numeric IDs.
+ * Branch codes are alphanumeric identifiers set in Docebo admin.
+ * Always keep this mapping in sync with Docebo platform config.
+ *
+ * To retrieve actual branch IDs:
+ *   GET /manage/v1/orgchart?page_size=200
+ * Or use the branch code with use_secondary_identifier=true
+ */
+class DoceboBranches
+{
+    /**
+     * Cluster definitions.
+     * Each cluster maps portal country codes to a Docebo branch.
+     *
+     * - branch_id: Docebo numeric internal ID (from org chart)
+     * - branch_code: Alphanumeric code set in Docebo (for secondary_identifier lookups)
+     * - countries: ISO 3166-1 alpha-2 country codes served by this cluster
+     * - language: Default Docebo language for users in this cluster
+     * - catalog_ids: Docebo catalog IDs visible to this cluster's users
+     */
+    public const CLUSTERS = [
+        'iberia' => [
+            'branch_id' => null,      // TODO: Replace with actual Docebo branch ID
+            'branch_code' => 'EMEA-IBE',
+            'countries' => ['ES', 'PT'],
+            'language' => 'spanish',   // Default; PT users may override to 'portuguese'
+            'catalog_ids' => [],       // TODO: Assign catalog IDs
+            'timezone' => 'Europe/Madrid',
+        ],
+        'italy' => [
+            'branch_id' => null,
+            'branch_code' => 'EMEA-ITA',
+            'countries' => ['IT'],
+            'language' => 'italian',
+            'catalog_ids' => [],
+            'timezone' => 'Europe/Rome',
+        ],
+        'dach' => [
+            'branch_id' => null,
+            'branch_code' => 'EMEA-DACH',
+            'countries' => ['DE', 'AT', 'CH'],
+            'language' => 'german',
+            'catalog_ids' => [],
+            'timezone' => 'Europe/Berlin',
+        ],
+        'france' => [
+            'branch_id' => null,
+            'branch_code' => 'EMEA-FRA',
+            'countries' => ['FR'],
+            'language' => 'french',
+            'catalog_ids' => [],
+            'timezone' => 'Europe/Paris',
+        ],
+        'uki' => [
+            'branch_id' => null,
+            'branch_code' => 'EMEA-UKI',
+            'countries' => ['GB', 'IE'],
+            'language' => 'english',
+            'catalog_ids' => [],
+            'timezone' => 'Europe/London',
+        ],
+        'benelux' => [
+            'branch_id' => null,
+            'branch_code' => 'EMEA-BNL',
+            'countries' => ['NL', 'BE', 'LU'],
+            'language' => 'dutch',     // Default; BE users may prefer 'french'
+            'catalog_ids' => [],
+            'timezone' => 'Europe/Amsterdam',
+        ],
+        'russia' => [
+            'branch_id' => null,
+            'branch_code' => 'EMEA-RUS',
+            'countries' => ['RU'],
+            'language' => 'russian',
+            'catalog_ids' => [],
+            'timezone' => 'Europe/Moscow',
+        ],
+        'mena' => [
+            'branch_id' => null,
+            'branch_code' => 'EMEA-MENA',
+            'countries' => ['AE', 'SA', 'KW', 'QA', 'BH', 'OM', 'EG', 'LB', 'JO'],
+            'language' => 'english',   // Content primarily in English; Arabic for some materials
+            'catalog_ids' => [],
+            'timezone' => 'Asia/Dubai',
+        ],
+        'distribution_partners' => [
+            'branch_id' => null,
+            'branch_code' => 'EMEA-DP',
+            'countries' => [],         // Various markets — resolved by explicit assignment
+            'language' => 'english',
+            'catalog_ids' => [],
+            'timezone' => 'Europe/London',
+        ],
+    ];
+
+    /**
+     * Resolve cluster from HCP's country code.
+     *
+     * @param string $countryCode ISO 3166-1 alpha-2 (e.g., 'ES', 'DE')
+     * @return string|null Cluster key or null if not mapped
+     */
+    public static function resolveCluster(string $countryCode): ?string
+    {
+        $countryCode = strtoupper($countryCode);
+        foreach (self::CLUSTERS as $clusterKey => $cluster) {
+            if (in_array($countryCode, $cluster['countries'], true)) {
+                return $clusterKey;
+            }
+        }
+        return null; // Unmapped country — may need manual assignment
+    }
+
+    /**
+     * Get Docebo branch ID for a cluster.
+     *
+     * @throws \RuntimeException if branch_id not configured
+     */
+    public static function getBranchId(string $clusterKey): int
+    {
+        $cluster = self::CLUSTERS[$clusterKey] ?? null;
+        if (!$cluster) {
+            throw new \RuntimeException("Unknown cluster: {$clusterKey}");
+        }
+        if (!$cluster['branch_id']) {
+            throw new \RuntimeException(
+                "Docebo branch_id not configured for cluster '{$clusterKey}'. "
+                . "Retrieve from GET /manage/v1/orgchart and update DoceboBranches.php"
+            );
+        }
+        return $cluster['branch_id'];
+    }
+
+    /**
+     * Get branch code (for use_secondary_identifier lookups).
+     */
+    public static function getBranchCode(string $clusterKey): string
+    {
+        return self::CLUSTERS[$clusterKey]['branch_code']
+            ?? throw new \RuntimeException("Unknown cluster: {$clusterKey}");
+    }
+
+    /**
+     * Get default Docebo language for a cluster.
+     * May be overridden per-user for multilingual clusters (Iberia, Benelux).
+     */
+    public static function getDefaultLanguage(string $clusterKey): string
+    {
+        return self::CLUSTERS[$clusterKey]['language'] ?? 'english';
+    }
+
+    /**
+     * Get all cluster keys.
+     */
+    public static function getAllClusterKeys(): array
+    {
+        return array_keys(self::CLUSTERS);
+    }
+}
+```
+
+## User Provisioning with Branch Assignment
+
+```php
+<?php
+// Integrate with the DoceboUserProvisioningService from docebo-auth-sso.mdc
+
+class EmEaUserProvisioner
+{
+    private DoceboUserProvisioningService $provisioner;
+
+    /**
+     * Provision an HCP into the correct EMEA cluster branch.
+     *
+     * @param HcpUser $hcp Portal user (must have country code)
+     * @return int Docebo user ID
+     * @throws UnmappedCountryException if country not in any cluster
+     */
+    public function provisionHcp(HcpUser $hcp): int
+    {
+        $clusterKey = DoceboBranches::resolveCluster($hcp->getCountryCode());
+
+        if (!$clusterKey) {
+            // Country not in any cluster — log and route to manual assignment
+            $this->logger->warning('HCP country not mapped to EMEA cluster', [
+                'email' => $hcp->getEmail(),
+                'country' => $hcp->getCountryCode()
+            ]);
+            // Default to Distribution Partners or throw
+            $clusterKey = 'distribution_partners';
+        }
+
+        $branchId = DoceboBranches::getBranchId($clusterKey);
+        return $this->provisioner->provisionUser($hcp, $branchId);
+    }
+
+    /**
+     * Move an HCP between clusters (e.g., country change, reallocation).
+     */
+    public function moveHcpToCluster(int $doceboUserId, string $newClusterKey): void
+    {
+        $branchId = DoceboBranches::getBranchId($newClusterKey);
+        $this->api->request('PUT', '/manage/v1/user/' . $doceboUserId, [
+            'branch_id' => $branchId
+        ]);
+    }
+}
+```
+
+## Branch API Operations
+
+```php
+// --- RETRIEVE ALL BRANCHES (to populate branch_id values) ---
+$branches = $api->request('GET', '/manage/v1/orgchart', [
+    'page_size' => 200
+]);
+// Response includes: id, code, name, parent_id, children_count, associated_users
+
+// --- GET BRANCH BY CODE (secondary identifier) ---
+$branch = $api->request('GET', '/manage/v1/orgchart/EMEA-IBE', [
+    'use_secondary_identifier' => 'true'
+]);
+// Returns branch details including numeric ID
+
+// --- LIST USERS IN A BRANCH ---
+$branchUsers = $api->request('GET', '/manage/v1/user', [
+    'branch_id' => $branchId,
+    'page_size' => 200
+]);
+
+// --- CREATE SUB-BRANCH (e.g., for a new market under a cluster) ---
+$api->request('POST', '/manage/v1/orgchart', [
+    'code' => 'EMEA-MENA-EG',
+    'name' => 'Egypt',
+    'parent_id' => $menaBranchId
+]);
+```
+
+## Content Visibility Model
+
+Extended Enterprise controls what each branch's users can see:
+
+1. **Catalogs**: Assigned per branch → users see only their cluster's catalogs
+2. **Courses**: Visible through catalogs OR direct enrollment
+3. **Learning Plans**: Assigned per branch or via enrollment rules
+4. **EMEA-wide content**: Assign to the root branch → inherits down to all clusters
+
+### Typical Catalog Structure
+
+```
+Global Catalogs (Root Branch — visible to all EMEA)
+├── Product Training — Global
+├── Compliance & Safety — EMEA
+└── Welcome & Onboarding
+
+Cluster-Specific Catalogs
+├── Iberia → Product Training — ES/PT, Local Regulations — Spain
+├── DACH → Product Training — DE/AT/CH, Local Regulations — Germany
+├── France → Product Training — FR, Local Regulations — France
+└── ... (each cluster has locale-specific catalogs)
+```
+
+### Catalog Assignment API
+
+```php
+// Assign catalog to a branch (making it visible to branch users)
+// NOTE: This is typically done in Docebo admin UI, not via API.
+// API supports reading catalog visibility:
+
+$catalogDetails = $api->request('GET', '/learn/v1/catalog/' . $catalogId);
+// Check 'sub_items' for courses and 'visibility' settings
+```
+
+## Multi-Language Handling
+
+Some clusters serve multiple languages:
+
+| Cluster | Primary | Secondary | Notes |
+|---|---|---|---|
+| Iberia | Spanish | Portuguese | PT users may need explicit language override |
+| Benelux | Dutch | French | BE-FR users need French; NL/LU stay Dutch |
+| MENA | English | Arabic | Arabic content may be limited; fallback to English |
+| DACH | German | — | CH may have French-speaking HCPs (rare) |
+
+```php
+/**
+ * Resolve the Docebo language for an HCP, considering cluster defaults
+ * and per-user overrides for multilingual clusters.
+ */
+function resolveDoceboLanguage(HcpUser $hcp, string $clusterKey): string
+{
+    // Check for explicit user language preference first
+    $portalLang = $hcp->getPreferredLanguage();
+
+    // Special cases for multilingual clusters
+    if ($clusterKey === 'iberia' && $hcp->getCountryCode() === 'PT') {
+        return 'portuguese';
+    }
+    if ($clusterKey === 'benelux' && $portalLang === 'fr') {
+        return 'french';
+    }
+
+    // Fall back to cluster default
+    return DoceboBranches::getDefaultLanguage($clusterKey);
+}
+```
+
+## Reporting by Cluster
+
+When extracting analytics, filter by branch to get cluster-specific data:
+
+```php
+// Get enrollment statistics for a specific cluster
+$clusterEnrollments = $api->request('GET', '/learn/v1/enrollments', [
+    'branch_id' => DoceboBranches::getBranchId('iberia'),
+    'page_size' => 200
+]);
+
+// For cross-cluster EMEA reporting, iterate all clusters:
+$allClusterData = [];
+foreach (DoceboBranches::getAllClusterKeys() as $clusterKey) {
+    $branchId = DoceboBranches::getBranchId($clusterKey);
+    $allClusterData[$clusterKey] = $api->request('GET', '/learn/v1/enrollments', [
+        'branch_id' => $branchId,
+        'page_size' => 200
+    ]);
+}
+```
+
+## Critical Rules
+
+- **Branch assignment is mandatory at provisioning** — users without a branch may see global content or nothing
+- **Branch codes must be unique** — Docebo returns HTTP 400 if a code is ambiguous
+- **Moving a user between branches changes their content visibility immediately** — plan migrations carefully
+- **Deactivation preserves branch assignment and training history** — prefer deactivation over deletion
+- **The `use_secondary_identifier=true` parameter is required** when using branch codes instead of numeric IDs
+- **Child branches inherit parent visibility** — a sub-branch under Iberia sees Iberia's catalogs plus its own
+- **Distribution Partners branch is a catch-all** — use for markets without a dedicated cluster, but flag for review
+- **Keep DoceboBranches.php in sync with Docebo admin** — branch IDs change if branches are recreated
+
+## Initialization Checklist
+
+When setting up the EMEA branch structure in a new or sandbox environment:
+
+1. Create the root branch in Docebo admin (or verify it exists)
+2. Create each cluster branch as a child of root
+3. Set branch codes matching the `branch_code` values in DoceboBranches.php
+4. Run `GET /manage/v1/orgchart?page_size=200` to retrieve numeric IDs
+5. Update `branch_id` values in DoceboBranches.php
+6. Assign catalogs to each branch in Docebo admin
+7. Test user provisioning for one user per cluster
+8. Verify content visibility matches expectations per branch
+
+## Docebo Documentation Links
+
+- Extended Enterprise: https://www.docebo.com/docebo-embed-learning-platform-enterprise-lms/
+- Org chart API: Available in API browser under `manage` service → Orgchart section
+- Branch management: Navigate to Docebo admin → Gear icon → Users and branches → Org chart
