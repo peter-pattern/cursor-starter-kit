@@ -1,1 +1,10 @@
+---
+description: Frontend standards
+globs: ["src/**/*.tsx", "src/**/*.ts", "components/**/*.tsx"]
+alwaysApply: false
+---
 
+- Keep business logic out of UI components.
+- Prefer existing design-system components before creating new ones.
+- Check accessibility for forms, buttons, labels, and keyboard navigation.
+- Optimize for readability over micro-optimizations.
