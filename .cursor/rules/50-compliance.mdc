@@ -1,1 +1,10 @@
+---
+description: Security and compliance guardrails
+globs: ["**/*auth*", "**/*user*", "**/*patient*", "**/*privacy*", "**/*consent*"]
+alwaysApply: false
+---
 
+- Minimize collection, storage, and exposure of personal data.
+- Do not log sensitive fields.
+- Prefer deny-by-default access patterns.
+- Flag any change impacting retention, auditability, consent, or data sharing.
