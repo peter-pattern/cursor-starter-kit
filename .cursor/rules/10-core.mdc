@@ -1,1 +1,10 @@
+---
+description: Core engineering rules for all code changes
+alwaysApply: true
+---
 
+- Keep changes minimal and reversible.
+- Do not edit unrelated files.
+- Prefer explicit code over clever code.
+- Preserve public interfaces unless the task requires a change.
+- Add tests for changed behavior.
