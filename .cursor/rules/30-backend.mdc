@@ -1,1 +1,10 @@
+---
+description: Backend standards
+globs: ["api/**/*.ts", "server/**/*.ts", "services/**/*.ts"]
+alwaysApply: false
+---
 
+- Validate all external input at the boundary.
+- Keep handlers thin and move logic into services.
+- Avoid breaking API contracts without explicit migration notes.
+- Add logging only where it helps operations; never log secrets or sensitive payloads.
